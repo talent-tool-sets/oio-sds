@@ -22,6 +22,8 @@ License along with this library.
 
 # include <glib.h>
 
+extern const char *oio_server_volume;
+
 /* Forward declarations externally defined */
 struct network_client_s;
 struct network_server_s;
@@ -59,6 +61,8 @@ struct gridd_reply_ctx_s
 
 	/* Return a data previously associated, or NULL if not found. */
 	gpointer (*get_cnx_data) (const gchar *key);
+
+	void (*no_access) (void);
 
 	/* --------------------------------
 	 * Context belonging to the request

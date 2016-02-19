@@ -55,7 +55,6 @@ static void sqlx_service_specific_stop(void);
 
 // Periodic tasks & thread's workers
 static void _task_malloc_trim(gpointer p);
-static void _task_register(gpointer p);
 static void _task_expire_bases(gpointer p);
 static void _task_expire_resolver(gpointer p);
 static void _task_react_elections(gpointer p);
@@ -92,13 +91,8 @@ static struct grid_main_option_s common_options[] =
 	{"Announce", OT_STRING, {.str = &SRV.announce},
 		"Announce this IP:PORT couple instead of the TCP endpoint"},
 
-	{"Tag", OT_LIST, {.lst = &SRV.custom_tags},
-		"Tag to associate to the SRV (multiple custom tags are supported)"},
-
 	{"Replicate", OT_BOOL, {.b = &SRV.flag_replicable},
 		"DO NOT USE THIS. This might disable the replication"},
-	{"NoRegister", OT_BOOL, {.b = &SRV.flag_noregister},
-		"DO NOT USE THIS. The SRV won't register in the conscience"},
 
 	{"Sqlx.Sync.Repli", OT_UINT, {.u = &SRV.sync_mode_repli},
 		"SYNC mode to be applied on replicated bases after open "
@@ -251,14 +245,10 @@ _init_configless_structures(struct sqlx_service_s *ss)
 {
 	if (!(ss->server = network_server_init())
 			|| !(ss->dispatcher = transport_gridd_build_empty_dispatcher())
-			|| !(ss->si = g_malloc0(sizeof(struct service_info_s)))
 			|| !(ss->clients_pool = gridd_client_pool_create())
 			|| !(ss->clients_factory = gridd_client_factory_create())
-			|| !(ss->gsr_reqtime = grid_single_rrd_create(oio_ext_monotonic_time() / G_TIME_SPAN_SECOND, 8))
-			|| !(ss->gsr_reqcounter = grid_single_rrd_create(oio_ext_monotonic_time() / G_TIME_SPAN_SECOND,8))
 			|| !(ss->resolver = hc_resolver_create1(oio_ext_monotonic_time() / G_TIME_SPAN_SECOND))
 			|| !(ss->gtq_admin = grid_task_queue_create("admin"))
-			|| !(ss->gtq_register = grid_task_queue_create("register"))
 			|| !(ss->gtq_reload = grid_task_queue_create("reload"))) {
 		GRID_WARN("SERVICE init error : memory allocation failure");
 		return FALSE;
@@ -372,8 +362,6 @@ _configure_backend(struct sqlx_service_s *ss)
 static gboolean
 _configure_tasks(struct sqlx_service_s *ss)
 {
-	grid_task_queue_register(ss->gtq_register, 1, _task_register, NULL, ss);
-
 	grid_task_queue_register(ss->gtq_reload, 5, _task_reload_nsinfo, NULL, ss);
 	grid_task_queue_register(ss->gtq_reload, 5, _task_reload_workers, NULL, ss);
 
@@ -403,47 +391,6 @@ _configure_events_queue (struct sqlx_service_s *ss)
 	}
 
 	GRID_INFO("Event queue ready, connected to [%s]", url);
-	return TRUE;
-}
-
-static void
-_add_custom_tags(struct service_info_s *si, GSList *tags)
-{
-	for (; tags ;tags = g_slist_next(tags)) {
-		gchar** tokens = g_strsplit((gchar*)(tags->data), "=", 2);
-		if (!tokens)
-			continue;
-		// TODO add more checks on the name and value.
-		if (tokens[0] && tokens[1]) {
-			gchar *n = g_strconcat("tag.", tokens[0], NULL);
-			service_tag_set_value_string(service_info_ensure_tag(si->tags, n),
-					tokens[1]);
-			g_free(n);
-		}
-		g_strfreev(tokens);
-	}
-}
-
-static gboolean
-_configure_registration(struct sqlx_service_s *ss)
-{
-	struct service_info_s *si = ss->si;
-
-	si->tags = g_ptr_array_new();
-	g_strlcpy(si->ns_name, ss->ns_name, sizeof(si->ns_name));
-	g_strlcpy(si->type, ss->service_config->srvtype, sizeof(si->type));
-	grid_string_to_addrinfo(ss->announce->str, &(si->addr));
-
-	service_tag_set_value_string(
-			service_info_ensure_tag(si->tags, "tag.type"),
-			ss->service_config->srvtag);
-
-	_add_custom_tags(si, ss->custom_tags);
-
-	service_tag_set_value_string(
-			service_info_ensure_tag(si->tags, "tag.vol"),
-			ss->volume);
-
 	return TRUE;
 }
 
@@ -481,6 +428,8 @@ sqlx_service_action(void)
 			return _action_report_error(err, "Volume lock failed");
 	}
 
+	oio_server_volume = SRV.volume;
+
 	gridd_client_pool_set_max(SRV.clients_pool, SRV.max_active);
 	network_server_set_maxcnx(SRV.server, SRV.max_passive);
 	network_server_set_cnx_backlog(SRV.server, SRV.cnx_backlog);
@@ -493,7 +442,6 @@ sqlx_service_action(void)
 
 	grid_task_queue_fire(SRV.gtq_reload);
 	grid_task_queue_fire(SRV.gtq_admin);
-	grid_task_queue_fire(SRV.gtq_register);
 	GRID_DEBUG("All tasks now fired once");
 
 	/* Start the administrative threads */
@@ -504,10 +452,6 @@ sqlx_service_action(void)
 	SRV.thread_reload = grid_task_queue_run(SRV.gtq_reload, &err);
 	if (!SRV.thread_reload)
 		return _action_report_error(err, "Failed to start the RELOAD thread");
-
-	SRV.thread_register = grid_task_queue_run(SRV.gtq_register, &err);
-	if (!SRV.thread_register)
-		return _action_report_error(err, "Failed to start the REGISTER thread");
 
 	SRV.thread_client = g_thread_try_new("clients", _worker_clients, &SRV, &err);
 	if (!SRV.thread_client)
@@ -528,6 +472,7 @@ sqlx_service_action(void)
 		return _action_report_error(err, "GRIDD bind failure");
 	if (!grid_main_is_running())
 		return;
+
 	if (NULL != (err = network_server_run(SRV.server)))
 		return _action_report_error(err, "GRIDD run failure");
 }
@@ -542,8 +487,6 @@ sqlx_service_specific_stop(void)
 		grid_task_queue_stop(SRV.gtq_admin);
 	if (SRV.gtq_reload)
 		grid_task_queue_stop(SRV.gtq_reload);
-	if (SRV.gtq_register)
-		grid_task_queue_stop(SRV.gtq_register);
 }
 
 static gboolean
@@ -557,7 +500,6 @@ sqlx_service_configure(int argc, char **argv)
 	    && _configure_replication(&SRV)
 	    && _configure_backend(&SRV)
 	    && _configure_tasks(&SRV)
-	    && _configure_registration(&SRV)
 	    && _configure_network(&SRV)
 	    && _configure_events_queue(&SRV)
 		&& (!SRV.service_config->post_config
@@ -592,8 +534,6 @@ sqlx_service_specific_fini(void)
 	// soft stop
 	if (SRV.gtq_reload)
 		grid_task_queue_stop(SRV.gtq_reload);
-	if (SRV.gtq_register)
-		grid_task_queue_stop(SRV.gtq_register);
 	if (SRV.gtq_admin)
 		grid_task_queue_stop(SRV.gtq_admin);
 
@@ -604,8 +544,6 @@ sqlx_service_specific_fini(void)
 
 	if (SRV.thread_reload)
 		g_thread_join(SRV.thread_reload);
-	if (SRV.thread_register)
-		g_thread_join(SRV.thread_register);
 	if (SRV.thread_admin)
 		g_thread_join(SRV.thread_admin);
 	if (SRV.thread_client)
@@ -631,8 +569,6 @@ sqlx_service_specific_fini(void)
 		grid_task_queue_destroy(SRV.gtq_admin);
 	if (SRV.gtq_reload)
 		grid_task_queue_destroy(SRV.gtq_reload);
-	if (SRV.gtq_register)
-		grid_task_queue_destroy(SRV.gtq_register);
 
 	if (SRV.server)
 		network_server_clean(SRV.server);
@@ -640,22 +576,11 @@ sqlx_service_specific_fini(void)
 		gridd_request_dispatcher_clean(SRV.dispatcher);
 	if (SRV.repository)
 		sqlx_repository_clean(SRV.repository);
-	if (SRV.election_manager)
-		election_manager_clean(SRV.election_manager);
 	if (SRV.sync)
 		sqlx_sync_clear(SRV.sync);
 	if (SRV.resolver)
 		hc_resolver_destroy(SRV.resolver);
 
-	if (SRV.gsr_reqtime)
-		grid_single_rrd_destroy(SRV.gsr_reqtime);
-	if (SRV.gsr_reqcounter)
-		grid_single_rrd_destroy(SRV.gsr_reqcounter);
-
-	if (SRV.custom_tags)
-		g_slist_free_full(SRV.custom_tags, g_free);
-	if (SRV.si)
-		service_info_clean(SRV.si);
 	if (SRV.announce)
 		g_string_free(SRV.announce, TRUE);
 	if (SRV.url)
@@ -665,6 +590,10 @@ sqlx_service_specific_fini(void)
 
 	if (SRV.clients_pool)
 		gridd_client_pool_destroy (SRV.clients_pool);
+
+	// Must be freed after SRV.clients_pool
+	if (SRV.election_manager)
+		election_manager_clean(SRV.election_manager);
 
 	if (SRV.lb)
 		grid_lbpool_destroy (SRV.lb);
@@ -753,43 +682,6 @@ _worker_clients(gpointer p)
 		}
 	}
 	return p;
-}
-
-static void
-_task_register(gpointer p)
-{
-	if (PSRV(p)->flag_noregister)
-		return;
-
-	/* Computes the avg requests rate/time */
-	time_t now = oio_ext_monotonic_time () / G_TIME_SPAN_SECOND;
-
-	grid_single_rrd_push (PSRV(p)->gsr_reqcounter, now,
-			network_server_stat_getone(PSRV(p)->server,
-				g_quark_from_static_string(OIO_STAT_PREFIX_REQ)));
-	grid_single_rrd_push (PSRV(p)->gsr_reqtime, now,
-			network_server_stat_getone(PSRV(p)->server,
-				g_quark_from_static_string(OIO_STAT_PREFIX_TIME)));
-
-	guint64 avg_counter = grid_single_rrd_get_delta(PSRV(p)->gsr_reqcounter,
-			now, 4);
-	guint64 avg_time = grid_single_rrd_get_delta(PSRV(p)->gsr_reqtime,
-			now, 4);
-
-	avg_counter = MACRO_COND(avg_counter != 0, avg_counter, 1);
-	avg_time = MACRO_COND(avg_time != 0, avg_time, 1);
-
-	service_tag_set_value_i64(service_info_ensure_tag(PSRV(p)->si->tags,
-				"stat.total_reqpersec"), avg_counter / 4);
-	service_tag_set_value_i64(service_info_ensure_tag(PSRV(p)->si->tags,
-				"stat.total_avreqtime"), (avg_time)/(avg_counter));
-
-	/* send the registration now */
-	GError *err = register_namespace_service(PSRV(p)->si);
-	if (err) {
-		g_message("Service registration failed: (%d) %s", err->code, err->message);
-		g_clear_error(&err);
-	}
 }
 
 static void
